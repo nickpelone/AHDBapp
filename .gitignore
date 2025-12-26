@@ -13,3 +13,7 @@
 
 testing/
 bench/
+
+AHDBapp
+*.db
+plans/

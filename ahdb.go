@@ -8,10 +8,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"os"
 	"regexp"
@@ -21,9 +23,54 @@ import (
 
 	"fortio.org/cli"
 	"fortio.org/log"
-	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/mooreatv/AHDBapp/lua2json"
 )
+
+const schemaSql = `
+CREATE TABLE IF NOT EXISTS items (
+    id TEXT NOT NULL,
+    shortid INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    SellPrice INTEGER NOT NULL,
+    StackCount INTEGER NOT NULL,
+    ClassID INTEGER NOT NULL,
+    SubClassID INTEGER NOT NULL,
+    Rarity INTEGER NOT NULL,
+    MinLevel INTEGER NOT NULL,
+    link TEXT NOT NULL,
+    olink TEXT NOT NULL,
+    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id)
+);
+
+CREATE TABLE IF NOT EXISTS scanmeta (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    realm TEXT NOT NULL,
+    faction TEXT NOT NULL CHECK(faction IN ('Neutral', 'Alliance', 'Horde')),
+    scanner TEXT NOT NULL,
+    ts TIMESTAMP NOT NULL,
+    CONSTRAINT unique_scan UNIQUE (ts, scanner)
+);
+
+CREATE TABLE IF NOT EXISTS auctions (
+    scanId INTEGER NOT NULL REFERENCES scanmeta(id),
+    itemId TEXT NOT NULL REFERENCES items(id),
+    ts TIMESTAMP NOT NULL,
+    seller TEXT,
+    timeLeft INTEGER NOT NULL,
+    itemCount INTEGER NOT NULL,
+    minBid INTEGER NOT NULL,
+    buyout INTEGER NOT NULL,
+    curBid INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS buyoutidx ON auctions (buyout);
+CREATE INDEX IF NOT EXISTS nameidx on items (name);
+CREATE INDEX IF NOT EXISTS rarityidx on items (rarity);
+CREATE INDEX IF NOT EXISTS sellpriceidx on items (sellprice);
+CREATE INDEX IF NOT EXISTS itemididx on auctions (itemid);
+`
 
 // ScanEntry is 1 auction house scan result.
 type ScanEntry struct {
@@ -152,7 +199,7 @@ func ahDeserializeScanResult(stmt *sql.Stmt, scan ScanEntry, scanID int64) {
 
 // SaveScans exports the scan to the DB.
 func SaveScans(db *sql.DB, scans []ScanEntry) {
-	stmtMeta := "INSERT INTO scanmeta (realm, faction, scanner, ts) VALUES(?,?,?,FROM_UNIXTIME(?))"
+	stmtMeta := "INSERT INTO scanmeta (realm, faction, scanner, ts) VALUES(?,?,?,datetime(?, 'unixepoch'))"
 	var stmtMetaIns *sql.Stmt
 	var err error
 	if db != nil {
@@ -163,7 +210,7 @@ func SaveScans(db *sql.DB, scans []ScanEntry) {
 	}
 	stmtAuction := `
 INSERT INTO auctions (scanId, itemId, ts, seller, timeLeft, itemCount, minBid, buyout, curBid)
-			 VALUES (?,?, FROM_UNIXTIME(?), ?,   ?,         ?,        ?,      ?,      ?)
+			 VALUES (?,?, datetime(?, 'unixepoch'), ?,   ?,         ?,        ?,      ?,      ?)
 `
 	for idx := range scans {
 		entry := scans[idx]
@@ -221,18 +268,18 @@ func SaveItems(db *sql.DB, items map[string]interface{}) {
 		*/
 		stmt := `INSERT INTO items (id, shortid, name, sellprice, stackcount, classid, subclassid, rarity, minlevel, link, olink)
 							VALUES(?  , ?      , ?   , ?        , ?         , ?      , ?          , ?     , ?       , ?   , ?)
-							ON  DUPLICATE KEY UPDATE
-				ts=IF(VALUES(olink) = olink, ts, CURRENT_TIMESTAMP),
-				shortid=VALUES(shortid),
-				name=VALUES(name),
-				sellprice=VALUES(sellprice),
-				stackcount=VALUES(stackcount),
-				classid=VALUES(classid),
-				subclassid=VALUES(subclassid),
-				rarity=VALUES(rarity),
-				minlevel=VALUES(minlevel),
-				link=VALUES(link),
-				olink=VALUES(olink)`
+							ON CONFLICT(id) DO UPDATE SET
+				ts=CASE WHEN excluded.olink = items.olink THEN items.ts ELSE CURRENT_TIMESTAMP END,
+				shortid=excluded.shortid,
+				name=excluded.name,
+				sellprice=excluded.sellprice,
+				stackcount=excluded.stackcount,
+				classid=excluded.classid,
+				subclassid=excluded.subclassid,
+				rarity=excluded.rarity,
+				minlevel=excluded.minlevel,
+				link=excluded.link,
+				olink=excluded.olink`
 		stmtIns, err = tx.Prepare(stmt)
 		if err != nil {
 			log.Fatalf("Can't prepare statement for insert: %v", err)
@@ -271,7 +318,7 @@ func SaveItems(db *sql.DB, items map[string]interface{}) {
 			log.Fatalf("Can't DB commit: %v", err)
 		}
 		elapsed := time.Since(start)
-		log.Infof("Inserted/updated %d items, %.2f Mbytes in MySQL DB in %s", n, float64(bytes)/1024./1024., elapsed)
+		log.Infof("Inserted/updated %d items, %.2f Mbytes in DB in %s", n, float64(bytes)/1024./1024., elapsed)
 		if err = db.QueryRow("select count(*) from items").Scan(&count); err != nil {
 			log.Fatalf("Can't count items after insert: %v", err)
 		}
@@ -283,24 +330,23 @@ func SaveItems(db *sql.DB, items map[string]interface{}) {
 
 // SaveToDB saves items -> db.
 func SaveToDB(ahd AHData, noDB bool) {
-	user := os.Getenv("MYSQL_USER")
-	passwd := os.Getenv("MYSQL_PASSWORD")
-	connect := os.Getenv("MYSQL_CONNECTION_INFO")
-	if user == "" {
-		user = "root"
-	}
-	if connect == "" {
-		connect = "tcp(:3306)"
-	}
 	log.Infof("Starting DB save with noDB=%v ...", noDB)
 	var db *sql.DB
 	var err error
 	if !noDB {
-		db, err = sql.Open("mysql", user+":"+passwd+"@"+connect+"/ahdb")
+		filename := fmt.Sprintf("ahdb_%s.db", time.Now().Format("20060102-150405"))
+		log.Infof("Opening new SQLite DB: %s", filename)
+		db, err = sql.Open("sqlite3", filename)
 		if err != nil {
 			log.Fatalf("Can't open DB: %v", err)
 		}
 		defer db.Close()
+		if _, err = db.Exec(schemaSql); err != nil {
+			log.Fatalf("Can't execute schema: %v", err)
+		}
+		if _, err = db.Exec("PRAGMA foreign_keys = ON;"); err != nil {
+			log.Fatalf("Can't enable foreign keys: %v", err)
+		}
 	}
 	SaveItems(db, ahd.ItemDB)
 	SaveScans(db, ahd.Ah)
@@ -333,15 +379,35 @@ func main() {
 		var jW io.Writer
 		jR, jW = io.Pipe()
 		go func() {
-			lua2json.Lua2Json(os.Stdin, jW, true /* need to skip to level */, *buffSize)
+			lua2json.Lua2Json(os.Stdin, jW, false /* need to skip to level */, *buffSize)
 		}()
 	}
 	var ahdb AHData
 	jdec := json.NewDecoder(jR)
 	jdec.UseNumber()
-	if err := jdec.Decode(&ahdb); err != nil {
+
+	var generic map[string]interface{}
+	if err := jdec.Decode(&generic); err != nil {
 		log.Fatalf("Unable to unmarshal json result: %#v", err)
 	}
+	if val, ok := generic["AuctionDBSaved"]; ok {
+		if asMap, ok := val.(map[string]interface{}); ok {
+			generic = asMap
+			log.Infof("Detected and unwrapped AuctionDBSaved top-level key")
+		}
+	}
+	// Convert back to AHData (using roundtrip marshal/unmarshal for simplicity)
+	b, err := json.Marshal(generic)
+	if err != nil {
+		log.Fatalf("Unable to marshal generic map: %v", err)
+	}
+	// Use a decoder to unmarshal with UseNumber()
+	dec2 := json.NewDecoder(bytes.NewReader(b))
+	dec2.UseNumber()
+	if err := dec2.Decode(&ahdb); err != nil {
+		log.Fatalf("Unable to unmarshal into AHData: %v", err)
+	}
+
 	fv := ahdb.ItemDB["_formatVersion_"]
 	if fv == nil || fv.(json.Number).String() != "5" {
 		log.Errf("Unexpected itemDB format version %v", ahdb.ItemDB["_formatVersion_"])
