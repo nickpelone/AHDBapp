@@ -349,6 +349,22 @@ func SaveToDB(ahd AHData, noDB bool) {
 		}
 	}
 	SaveItems(db, ahd.ItemDB)
+
+	if len(ahd.Ah) > 0 {
+		// Select the scan with the largest TS
+		bestIdx := 0
+		maxTS := -1
+		for i, s := range ahd.Ah {
+			if s.TS > maxTS {
+				maxTS = s.TS
+				bestIdx = i
+			}
+		}
+		scan := ahd.Ah[bestIdx]
+		log.Infof("Selecting scan #%d with largest TS %d (from %d scans)", bestIdx+1, scan.TS, len(ahd.Ah))
+		ahd.Ah = []ScanEntry{scan}
+	}
+
 	SaveScans(db, ahd.Ah)
 }
 
