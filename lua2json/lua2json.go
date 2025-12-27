@@ -89,7 +89,8 @@ func Lua2Json(in io.Reader, out io.Writer, skipTop bool, bufSizeMb float64) {
 	_, _ = out.Write([]byte("{\n"))
 	// BEGIN {startnest=0; inarray=0}
 	startNest := false
-	inArray := false
+	// inArray stack: true for array, false for object
+	stack := []bool{}
 	trailingCommaFind := regexp.MustCompile(`},?$`)
 	colonFind := regexp.MustCompile(`^[^:]+$`)
 	prevLine := ""
@@ -106,39 +107,44 @@ func Lua2Json(in io.Reader, out io.Writer, skipTop bool, bufSizeMb float64) {
 		for _, r := range re {
 			line = r.find.ReplaceAllString(line, r.replaceBy)
 		}
-		log.Debugf("line after REs: %q\nin array %v nest %v prevLine: %q", line, inArray, startNest, prevLine)
-		// Awk conversion section:
-		//		/},?$/ {gsub(",$", "", l); if (inarray) gsub("}", "]"); inarray=0}
+		
+		// Logic update: Use stack to track nesting.
+		// 1. Resolve pending startNest from previous line
+		if startNest {
+			// If current line has no colon, we assume it's an array element (or empty block end).
+			// If it has a colon, it's an object key.
+			if colonFind.MatchString(line) {
+				prevLine = brace2bracket(prevLine)
+				stack = append(stack, true) // It's an array
+			} else {
+				stack = append(stack, false) // It's an object
+			}
+			startNest = false
+		}
+
+		// 2. Handle closing of blocks (trailing comma or brace)
 		if trailingCommaFind.MatchString(line) {
 			lpp := len(prevLine) - 1
 			if lpp >= 0 && prevLine[lpp] == ',' {
 				prevLine = prevLine[0:lpp]
 			}
-			if inArray {
+			// Pop from stack
+			isArray := false
+			if len(stack) > 0 {
+				isArray = stack[len(stack)-1]
+				stack = stack[:len(stack)-1]
+			}
+			if isArray {
 				line = strings.ReplaceAll(line, "}", "]")
 			}
-			inArray = false
 		}
-		log.Debugf("#2 prevLine: %q", prevLine)
-		//		/^[^:]+$/ {if (startnest) gsub("{$", "[", l); startnest=0; inarray=1}
-		if colonFind.MatchString(line) {
-			if startNest {
-				prevLine = brace2bracket(prevLine)
-			}
-			startNest = false
-			inArray = true
-		}
-		//		/: / {inarray=0}
-		if strings.Contains(line, ": ") {
-			inArray = false
-		}
-		//		/{$/ {startnest=1}
+
+		// 3. Check if current line starts a new block
 		lastPos := len(line) - 1
 		if lastPos >= 0 && line[lastPos] == '{' {
 			startNest = true
-			inArray = true // for empty arrays/lists
 		}
-		//		{if (l) print l; l=$0}
+
 		if prevLine != "" {
 			fmt.Fprintln(out, prevLine)
 		}
