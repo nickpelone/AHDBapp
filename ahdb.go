@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -337,13 +338,19 @@ func SaveItems(db *sql.DB, items map[string]interface{}) error {
 }
 
 // SaveToDB saves items -> db.
-func SaveToDB(ahd AHData, noDB bool) {
+func SaveToDB(ahd AHData, noDB bool, outDir string) {
 	log.Infof("Starting DB save with noDB=%v ...", noDB)
 	var db *sql.DB
 	var err error
 	var filename string
 	if !noDB {
 		filename = fmt.Sprintf("ahdb_%s.db", time.Now().Format("20060102-150405"))
+		if outDir != "" {
+			if err := os.MkdirAll(outDir, 0755); err != nil {
+				log.Fatalf("Can't create output directory %s: %v", outDir, err)
+			}
+			filename = filepath.Join(outDir, filename)
+		}
 		log.Infof("Opening new SQLite DB: %s", filename)
 		db, err = sql.Open("sqlite3", filename)
 		if err != nil {
@@ -412,21 +419,47 @@ var (
 )
 
 func main() {
+	cli.MinArgs = 0
+	cli.MaxArgs = 2
+	cli.ArgsHelp = " [input_file] [output_dir]"
 	cli.Main()
+	args := flag.Args()
+	var inputReader io.Reader = os.Stdin
+	var inputName = "stdin"
+	var outDir string
+
+	if len(args) >= 1 {
+		inputName = args[0]
+		if inputName == "-" {
+			inputReader = os.Stdin
+			inputName = "stdin"
+		} else {
+			f, err := os.Open(inputName)
+			if err != nil {
+				log.Fatalf("Error opening input file %s: %v", inputName, err)
+			}
+			defer f.Close()
+			inputReader = f
+		}
+	}
+	if len(args) >= 2 {
+		outDir = args[1]
+	}
+
 	if *jsonOnly {
-		log.Infof("AHDB lua2json started (reading from stdin)...")
-		lua2json.Lua2Json(os.Stdin, os.Stdout, *skipToplevel, *buffSize)
+		log.Infof("AHDB lua2json started (reading from %s)...", inputName)
+		lua2json.Lua2Json(inputReader, os.Stdout, *skipToplevel, *buffSize)
 		return
 	}
-	log.Infof("AHDB parser started (reading from stdin)...")
+	log.Infof("AHDB parser started (reading from %s)...", inputName)
 	var jR io.Reader
 	if *jsonInput {
-		jR = os.Stdin
+		jR = inputReader
 	} else {
 		var jW io.Writer
 		jR, jW = io.Pipe()
 		go func() {
-			lua2json.Lua2Json(os.Stdin, jW, false /* need to skip to level */, *buffSize)
+			lua2json.Lua2Json(inputReader, jW, false /* need to skip to level */, *buffSize)
 		}()
 	}
 	var ahdb AHData
@@ -465,5 +498,5 @@ func main() {
 		log.Errf("Unexpected itemDB count %v vs %d - 5", ahdb.ItemDB["_count_"], len(ahdb.ItemDB))
 	}
 	log.Infof("Deserialization done, found %d scans. ItemDB has %d items.", len(ahdb.Ah), len(ahdb.ItemDB)-5) // 4 _ meta keys so far
-	SaveToDB(ahdb, *noDB)
+	SaveToDB(ahdb, *noDB, outDir)
 }
