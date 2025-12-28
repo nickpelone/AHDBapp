@@ -117,7 +117,17 @@ type AuctionEntry struct {
 }
 
 // Re for '5000,1,1,0,1,0|cffffffff|Hitem:14046::::::::5:::::::|h[Runecloth Bag]|h|r'.
-var itemRegex = regexp.MustCompile(`^([0-9]+),([0-9]+),([0-9]+),([0-9]+),([0-9]+),([0-9]+)(\|[^|]+\|Hitem:([0-9]+)[^|]+\|h\[([^]]+)\]\|h\|r)$`)
+var itemRegex = regexp.MustCompile(`^([0-9]+(?:\.[0-9]+)?),([0-9]+),([0-9]+),([0-9]+),([0-9]+),([0-9]+)(\|[^|]+\|Hitem:([0-9]+)[^|]+\|h\[([^]]+)\]\|h\|r)$`)
+
+func atoi(s string) int {
+	if i, err := strconv.Atoi(s); err == nil {
+		return i
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return int(f + 0.5)
+	}
+	return 0
+}
 
 func extractItemInfo(id, olink string) *ItemEntry {
 	e := ItemEntry{ID: id, Olink: olink}
@@ -129,13 +139,13 @@ func extractItemInfo(id, olink string) *ItemEntry {
 		log.Critf("Unexpected mismatch for item %q", olink)
 		return &e
 	}
-	e.SellPrice, _ = strconv.Atoi(res[1])
-	e.StackCount, _ = strconv.Atoi(res[2])
-	e.ClassID, _ = strconv.Atoi(res[3])
-	e.SubClassID, _ = strconv.Atoi(res[4])
-	e.Rarity, _ = strconv.Atoi(res[5])
-	e.MinLevel, _ = strconv.Atoi(res[6])
-	e.ShortID, _ = strconv.Atoi(res[8])
+	e.SellPrice = atoi(res[1])
+	e.StackCount = atoi(res[2])
+	e.ClassID = atoi(res[3])
+	e.SubClassID = atoi(res[4])
+	e.Rarity = atoi(res[5])
+	e.MinLevel = atoi(res[6])
+	e.ShortID = atoi(res[8])
 	e.Link = res[7]
 	e.Name = res[9]
 	return &e
@@ -146,7 +156,7 @@ func extractAuctionData(auction string) AuctionEntry {
 	split := strings.Split(auction, ",")
 	splitI := make([]int, len(split))
 	for i := range split {
-		splitI[i], _ = strconv.Atoi(split[i])
+		splitI[i] = atoi(split[i])
 	}
 	return AuctionEntry{TimeLeft: splitI[0], ItemCount: splitI[1], MinBid: splitI[2], Buyout: splitI[3], CurBid: splitI[4]}
 }
