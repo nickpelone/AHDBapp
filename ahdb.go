@@ -151,7 +151,7 @@ func extractAuctionData(auction string) AuctionEntry {
 }
 
 // Go version of :ahDeserializeScanResult() https://github.com/mooreatv/MoLib/blob/v7.11.01/MoLibAH.lua#L375
-func ahDeserializeScanResult(stmt *sql.Stmt, scan ScanEntry, scanID int64) {
+func ahDeserializeScanResult(stmt *sql.Stmt, scan ScanEntry, scanID int64) error {
 	data := scan.Data
 	log.LogVf("Deserializing data length %d", len(data))
 	numItems := 0
@@ -185,7 +185,7 @@ func ahDeserializeScanResult(stmt *sql.Stmt, scan ScanEntry, scanID int64) {
 				if stmt != nil {
 					_, err := stmt.Exec(scanID, item, scan.TS, seller, a.TimeLeft, a.ItemCount, a.MinBid, a.Buyout, a.CurBid)
 					if err != nil {
-						log.Fatalf("Can't insert in DB op#%d for scanid %d: %v", opCount, scanID, err)
+						return fmt.Errorf("can't insert in DB op#%d for scanid %d: %v", opCount, scanID, err)
 					}
 				}
 			}
@@ -195,17 +195,18 @@ func ahDeserializeScanResult(stmt *sql.Stmt, scan ScanEntry, scanID int64) {
 	if numItems != scan.ItemsCount {
 		log.Errf("Mismatch between deserialization item count %d and saved %d", numItems, scan.ItemsCount)
 	}
+	return nil
 }
 
 // SaveScans exports the scan to the DB.
-func SaveScans(db *sql.DB, scans []ScanEntry) {
+func SaveScans(db *sql.DB, scans []ScanEntry) error {
 	stmtMeta := "INSERT INTO scanmeta (realm, faction, scanner, ts) VALUES(?,?,?,datetime(?, 'unixepoch'))"
 	var stmtMetaIns *sql.Stmt
 	var err error
 	if db != nil {
 		stmtMetaIns, err = db.Prepare(stmtMeta)
 		if err != nil {
-			log.Fatalf("Can't prepare statement for scanmeta insert: %v", err)
+			return fmt.Errorf("can't prepare statement for scanmeta insert: %v", err)
 		}
 	}
 	stmtAuction := `
@@ -215,7 +216,7 @@ INSERT INTO auctions (scanId, itemId, ts, seller, timeLeft, itemCount, minBid, b
 	for idx := range scans {
 		entry := scans[idx]
 		if db == nil {
-			ahDeserializeScanResult(nil, entry, -1)
+			_ = ahDeserializeScanResult(nil, entry, -1)
 			continue
 		}
 		res, err := stmtMetaIns.Exec(entry.Realm, entry.Faction, entry.Char, entry.TS)
@@ -225,27 +226,31 @@ INSERT INTO auctions (scanId, itemId, ts, seller, timeLeft, itemCount, minBid, b
 		}
 		var scanID int64
 		if scanID, err = res.LastInsertId(); err != nil {
-			log.Fatalf("Unable to get id after scanmeta insert: %v", err)
+			return fmt.Errorf("unable to get id after scanmeta insert: %v", err)
 		}
 		log.LogVf("Inserted successfully scan meta id %d", scanID)
 		tx, err := db.BeginTx(context.Background(), nil)
 		if err != nil {
-			log.Fatalf("Can't start a transaction: %v", err)
+			return fmt.Errorf("can't start a transaction: %v", err)
 		}
 		stmtIns, err := tx.Prepare(stmtAuction)
 		if err != nil {
-			log.Fatalf("Can't prepare statement for insert: %v", err)
+			return fmt.Errorf("can't prepare statement for insert: %v", err)
 		}
-		ahDeserializeScanResult(stmtIns, entry, scanID)
+		if err := ahDeserializeScanResult(stmtIns, entry, scanID); err != nil {
+			tx.Rollback()
+			return err
+		}
 		if err = tx.Commit(); err != nil {
-			log.Fatalf("Can't DB commit auction for scan %d: %v", scanID, err)
+			return fmt.Errorf("can't DB commit auction for scan %d: %v", scanID, err)
 		}
 	}
 	// log.Infof("After big commit of all the scans...")
+	return nil
 }
 
 // SaveItems exports the items to the DB.
-func SaveItems(db *sql.DB, items map[string]interface{}) {
+func SaveItems(db *sql.DB, items map[string]interface{}) error {
 	count := -1
 	var stmtIns *sql.Stmt
 	var tx *sql.Tx
@@ -253,12 +258,12 @@ func SaveItems(db *sql.DB, items map[string]interface{}) {
 	if db != nil {
 		err = db.QueryRow("select count(*) from items").Scan(&count)
 		if err != nil {
-			log.Fatalf("Can't count items: %v", err)
+			return fmt.Errorf("can't count items: %v", err)
 		}
 		log.Infof("ItemDB at start has %d items", count)
 		tx, err = db.BeginTx(context.Background(), nil)
 		if err != nil {
-			log.Fatalf("Can't start a transaction: %v", err)
+			return fmt.Errorf("can't start a transaction: %v", err)
 		}
 		/* 	this (also) works to conditionally update only if changed (when passed k,v twice but is slower
 			stmt := `
@@ -282,7 +287,8 @@ func SaveItems(db *sql.DB, items map[string]interface{}) {
 				olink=excluded.olink`
 		stmtIns, err = tx.Prepare(stmt)
 		if err != nil {
-			log.Fatalf("Can't prepare statement for insert: %v", err)
+			tx.Rollback()
+			return fmt.Errorf("can't prepare statement for insert: %v", err)
 		}
 		defer stmtIns.Close()
 	}
@@ -308,24 +314,26 @@ func SaveItems(db *sql.DB, items map[string]interface{}) {
 			e := extractItemInfo(k, v)
 			_, err = stmtIns.Exec(e.ID, e.ShortID, e.Name, e.SellPrice, e.StackCount, e.ClassID, e.SubClassID, e.Rarity, e.MinLevel, e.Link, e.Olink)
 			if err != nil {
-				log.Fatalf("Can't insert in DB: %v", err)
+				tx.Rollback()
+				return fmt.Errorf("can't insert in DB: %v", err)
 			}
 		}
 		n++
 	}
 	if db != nil {
 		if err = tx.Commit(); err != nil {
-			log.Fatalf("Can't DB commit: %v", err)
+			return fmt.Errorf("can't DB commit: %v", err)
 		}
 		elapsed := time.Since(start)
 		log.Infof("Inserted/updated %d items, %.2f Mbytes in DB in %s", n, float64(bytes)/1024./1024., elapsed)
 		if err = db.QueryRow("select count(*) from items").Scan(&count); err != nil {
-			log.Fatalf("Can't count items after insert: %v", err)
+			return fmt.Errorf("can't count items after insert: %v", err)
 		}
 		log.Infof("ItemDB now has %d items", count)
 	} else {
 		log.Infof("Parsed %d items, %.2f Mbytes in %s", n, float64(bytes)/1024./1024., time.Since(start))
 	}
+	return nil
 }
 
 // SaveToDB saves items -> db.
@@ -333,8 +341,9 @@ func SaveToDB(ahd AHData, noDB bool) {
 	log.Infof("Starting DB save with noDB=%v ...", noDB)
 	var db *sql.DB
 	var err error
+	var filename string
 	if !noDB {
-		filename := fmt.Sprintf("ahdb_%s.db", time.Now().Format("20060102-150405"))
+		filename = fmt.Sprintf("ahdb_%s.db", time.Now().Format("20060102-150405"))
 		log.Infof("Opening new SQLite DB: %s", filename)
 		db, err = sql.Open("sqlite3", filename)
 		if err != nil {
@@ -342,13 +351,32 @@ func SaveToDB(ahd AHData, noDB bool) {
 		}
 		defer db.Close()
 		if _, err = db.Exec(schemaSql); err != nil {
+			db.Close()
+			os.Remove(filename)
 			log.Fatalf("Can't execute schema: %v", err)
 		}
 		if _, err = db.Exec("PRAGMA foreign_keys = ON;"); err != nil {
+			db.Close()
+			os.Remove(filename)
 			log.Fatalf("Can't enable foreign keys: %v", err)
 		}
 	}
-	SaveItems(db, ahd.ItemDB)
+
+	cleanup := func() {
+		if db != nil {
+			db.Close()
+			if err := os.Remove(filename); err != nil {
+				log.Errf("Failed to remove %s: %v", filename, err)
+			} else {
+				log.Infof("Removed incomplete DB file %s", filename)
+			}
+		}
+	}
+
+	if err := SaveItems(db, ahd.ItemDB); err != nil {
+		cleanup()
+		log.Fatalf("SaveItems failed: %v", err)
+	}
 
 	if len(ahd.Ah) > 0 {
 		// Select the scan with the largest TS
@@ -365,7 +393,10 @@ func SaveToDB(ahd AHData, noDB bool) {
 		ahd.Ah = []ScanEntry{scan}
 	}
 
-	SaveScans(db, ahd.Ah)
+	if err := SaveScans(db, ahd.Ah); err != nil {
+		cleanup()
+		log.Fatalf("SaveScans failed: %v", err)
+	}
 }
 
 // Go version of :AHGetAuctionInfoByLink() https://github.com/mooreatv/MoLib/blob/v7.11.01/MoLibAH.lua#L86
