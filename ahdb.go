@@ -353,13 +353,33 @@ func SaveToDB(ahd AHData, noDB bool, outDir string) {
 	var db *sql.DB
 	var err error
 	var filename string
+	fileTime := time.Now()
+	if len(ahd.Ah) > 0 {
+		// Select the scan with the largest TS
+		bestIdx := 0
+		maxTS := -1
+		for i, s := range ahd.Ah {
+			if s.TS > maxTS {
+				maxTS = s.TS
+				bestIdx = i
+			}
+		}
+		scan := ahd.Ah[bestIdx]
+		log.Infof("Selecting scan #%d with largest TS %d (from %d scans)", bestIdx+1, scan.TS, len(ahd.Ah))
+		ahd.Ah = []ScanEntry{scan}
+		fileTime = time.Unix(int64(maxTS), 0)
+	}
 	if !noDB {
-		filename = fmt.Sprintf("ahdb_%s.db", time.Now().Format("20060102-150405"))
+		filename = fmt.Sprintf("ahdb_%s.db", fileTime.Format("20060102-150405"))
 		if outDir != "" {
 			if err := os.MkdirAll(outDir, 0755); err != nil {
 				log.Fatalf("Can't create output directory %s: %v", outDir, err)
 			}
 			filename = filepath.Join(outDir, filename)
+		}
+		if _, err := os.Stat(filename); err == nil {
+			log.Infof("File %s already exists, skipping.", filename)
+			return
 		}
 		log.Infof("Opening new SQLite DB: %s", filename)
 		db, err = sql.Open("sqlite3", filename)
@@ -393,21 +413,6 @@ func SaveToDB(ahd AHData, noDB bool, outDir string) {
 	if err := SaveItems(db, ahd.ItemDB); err != nil {
 		cleanup()
 		log.Fatalf("SaveItems failed: %v", err)
-	}
-
-	if len(ahd.Ah) > 0 {
-		// Select the scan with the largest TS
-		bestIdx := 0
-		maxTS := -1
-		for i, s := range ahd.Ah {
-			if s.TS > maxTS {
-				maxTS = s.TS
-				bestIdx = i
-			}
-		}
-		scan := ahd.Ah[bestIdx]
-		log.Infof("Selecting scan #%d with largest TS %d (from %d scans)", bestIdx+1, scan.TS, len(ahd.Ah))
-		ahd.Ah = []ScanEntry{scan}
 	}
 
 	if err := SaveScans(db, ahd.Ah); err != nil {
