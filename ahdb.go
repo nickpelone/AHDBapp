@@ -162,7 +162,7 @@ func extractAuctionData(auction string) AuctionEntry {
 }
 
 // Go version of :ahDeserializeScanResult() https://github.com/mooreatv/MoLib/blob/v7.11.01/MoLibAH.lua#L375
-func ahDeserializeScanResult(stmt *sql.Stmt, scan ScanEntry, scanID int64) error {
+func ahDeserializeScanResult(stmt *sql.Stmt, stmtItem *sql.Stmt, scan ScanEntry, scanID int64) error {
 	data := scan.Data
 	log.LogVf("Deserializing data length %d", len(data))
 	numItems := 0
@@ -176,6 +176,11 @@ func ahDeserializeScanResult(stmt *sql.Stmt, scan ScanEntry, scanID int64) error
 			log.Errf("Couldn't split %q into 2 by '!': %#v", itemEntry, itemSplit)
 		}
 		item := itemSplit[0]
+		if stmtItem != nil {
+			if _, err := stmtItem.Exec(item); err != nil {
+				return fmt.Errorf("failed to ensure item %s exists: %v", item, err)
+			}
+		}
 		rest := itemSplit[1]
 		// kr[item] = {}
 		// entry := kr[item]
@@ -224,10 +229,13 @@ func SaveScans(db *sql.DB, scans []ScanEntry) error {
 INSERT INTO auctions (scanId, itemId, ts, seller, timeLeft, itemCount, minBid, buyout, curBid)
 			 VALUES (?,?, datetime(?, 'unixepoch'), ?,   ?,         ?,        ?,      ?,      ?)
 `
+	stmtItem := `INSERT OR IGNORE INTO items (id, shortid, name, sellprice, stackcount, classid, subclassid, rarity, minlevel, link, olink)
+		VALUES(?, 0, 'Unknown', 0, 0, 0, 0, 0, 0, '', '')`
+
 	for idx := range scans {
 		entry := scans[idx]
 		if db == nil {
-			_ = ahDeserializeScanResult(nil, entry, -1)
+			_ = ahDeserializeScanResult(nil, nil, entry, -1)
 			continue
 		}
 		res, err := stmtMetaIns.Exec(entry.Realm, entry.Faction, entry.Char, entry.TS)
@@ -248,7 +256,11 @@ INSERT INTO auctions (scanId, itemId, ts, seller, timeLeft, itemCount, minBid, b
 		if err != nil {
 			return fmt.Errorf("can't prepare statement for insert: %v", err)
 		}
-		if err := ahDeserializeScanResult(stmtIns, entry, scanID); err != nil {
+		stmtItemIns, err := tx.Prepare(stmtItem)
+		if err != nil {
+			return fmt.Errorf("can't prepare statement for item insert: %v", err)
+		}
+		if err := ahDeserializeScanResult(stmtIns, stmtItemIns, entry, scanID); err != nil {
 			tx.Rollback()
 			return err
 		}
