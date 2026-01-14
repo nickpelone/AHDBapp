@@ -515,14 +515,33 @@ func main() {
 		log.Fatalf("Unable to unmarshal into AHData: %v", err)
 	}
 
+	if ahdb.ItemDB == nil {
+		for k, v := range generic {
+			if strings.HasPrefix(k, "itemDB_") {
+				if asMap, ok := v.(map[string]interface{}); ok {
+					log.Infof("Found %s, using it as ItemDB", k)
+					ahdb.ItemDB = asMap
+					break
+				}
+			}
+		}
+	}
+
 	fv := ahdb.ItemDB["_formatVersion_"]
-	if fv == nil || fv.(json.Number).String() != "5" {
-		log.Errf("Unexpected itemDB format version %v", ahdb.ItemDB["_formatVersion_"])
+	if fv == nil {
+		log.Warnf("Missing itemDB format version, assuming 5")
+	} else if fv.(json.Number).String() != "5" {
+		log.Errf("Unexpected itemDB format version %v", fv)
 		os.Exit(1)
 	}
-	ic, _ := ahdb.ItemDB["_count_"].(json.Number).Int64()
-	if int(ic) != len(ahdb.ItemDB)-5 {
-		log.Errf("Unexpected itemDB count %v vs %d - 5", ahdb.ItemDB["_count_"], len(ahdb.ItemDB))
+	icVal := ahdb.ItemDB["_count_"]
+	if icVal == nil {
+		log.Warnf("Missing itemDB count (_count_)")
+	} else {
+		ic, _ := icVal.(json.Number).Int64()
+		if int(ic) != len(ahdb.ItemDB)-5 {
+			log.Errf("Unexpected itemDB count %v vs %d - 5", icVal, len(ahdb.ItemDB))
+		}
 	}
 	log.Infof("Deserialization done, found %d scans. ItemDB has %d items.", len(ahdb.Ah), len(ahdb.ItemDB)-5) // 4 _ meta keys so far
 	SaveToDB(ahdb, *noDB, outDir)
